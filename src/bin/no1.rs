@@ -138,9 +138,6 @@ impl Configuration {
     }
 
     fn naive_accel_idxs(&self) -> Option<Vec<usize>> {
-        if self.dir != Direction::Right {
-            return None;
-        }
         if !self.rtape.first().contains(&&Item::P) || self.rtape.last().contains(&&Item::C(3)) {
             return None; // disable `3` on last position (so all 3s are in a valid position in the middle of a window)
         }
@@ -154,8 +151,7 @@ impl Configuration {
         }
 
         let mut min_exp = 1;
-        let to_exp_idxs: Option<Vec<usize>> = self
-            .rtape
+        self.rtape
             .as_slice()
             .windows(3)
             .enumerate()
@@ -164,7 +160,7 @@ impl Configuration {
                 [Item::X(_), Item::C(3), Item::X(exp_from)] => {
                     if *exp_from > min_exp {
                         min_exp = min_exp.checked_shl(2).unwrap();
-                        Some(Some(idx))
+                        Some(Some(idx + 2))
                     } else {
                         Some(None)
                     }
@@ -172,84 +168,40 @@ impl Configuration {
                 [_, Item::C(3), _] => Some(None), // if there is a `3` then it should be in a valid position
                 _ => None,
             })
-            .collect();
-        if min_exp == 1 { None } else { to_exp_idxs }
-    }
-
-    fn accelerate(&mut self) -> bool {
-        // return false;
-
-        let to_exp_idxs = self.naive_accel_idxs();
-
-        if let Some(idxs) = to_exp_idxs {
-            let mut move_exp_value: Exp = 1;
-            for idx in idxs {
-                if let Some(Item::X(exp)) = self.rtape.get_mut(idx) {
-                    *exp = exp.checked_add(move_exp_value.checked_shl(1).unwrap()).unwrap();
-                } else {
-                    unreachable!()
-                }
-                if let Some(Item::X(exp)) = self.rtape.get_mut(idx + 2) {
-                    *exp -= move_exp_value
-                } else {
-                    unreachable!()
-                }
-                move_exp_value = move_exp_value.checked_shl(2).unwrap();
-            }
-            self.dir = Direction::Left;
-            // There are 4 counter increments for every time the final C moves left.
-            self.stats.num_counter_increments = self.stats.num_counter_increments.checked_add(move_exp_value).unwrap();
-            true
-        } else {
-            false
-        }
+            .collect()
     }
 
     // Count number of "strides" (applications of accelerate()) we could perform before a
     // collision (considering only the right half of the tape).
-    fn count_accel_strides(rtape: &[Item]) -> Exp {
-        if !rtape
-            .iter()
-            .skip(1)
-            .all(|item| matches!(item, Item::D | Item::X(_) | Item::C(3) | Item::E { block: 1, exp: _ }))
-        {
-            return 0;
-        }
-
+    fn count_accel_strides(rtape: &[Item], cidxs: &[usize]) -> Exp {
         let mut min_exp = 1;
-        let max_reps = rtape
-            .windows(3)
-            .rev()
-            .filter_map(|w| match w {
-                [Item::X(_), Item::C(3), Item::X(exp_from)] => {
+        cidxs
+            .iter()
+            .map(|i| {
+                if let Some(Item::X(exp)) = rtape.get(*i) {
                     // Note: We don't want to take exp_from -> 0, so (exp_from - 1) / min_exp
-                    let this_reps = (exp_from.saturating_sub(1)) / min_exp;
+                    let this_reps = (exp.saturating_sub(1)) / min_exp;
                     min_exp = min_exp.checked_shl(2).unwrap();
-                    Some(this_reps)
+                    this_reps
+                } else {
+                    unreachable!()
                 }
-                [_, Item::C(3), _] => Some(0), // if there is a `3` then it should be in a valid position
-                _ => None,
             })
-            .min();
-        if let Some(reps) = max_reps {
-            reps
-        } else {
-            // This is the case where there are no Cs on the right. In that case we can do infinite strides b/c there are no Cs to collide!
-            Exp::MAX
-        }
+            .min()
+            .unwrap_or(Exp::MAX) // If there are no Cs on the right, we can do infinite strides b/c there are no Cs to collide!
     }
 
     // Apply multiple "strides" (applications of accelerate()) only to right hand side of tape.
     // Used for @uni-cycle acceleration.
-    fn apply_multiple_strides(&mut self, num_strides: Exp, idxs: Vec<usize>) {
+    fn apply_multiple_strides(&mut self, num_strides: Exp, cidxs: &[usize]) {
         let mut move_exp_value = num_strides;
-        for idx in idxs {
-            if let Some(Item::X(exp)) = self.rtape.get_mut(idx) {
+        for &idx in cidxs {
+            if let Some(Item::X(exp)) = self.rtape.get_mut(idx - 2) {
                 *exp = exp.checked_add(move_exp_value.checked_shl(1).unwrap()).unwrap();
             } else {
                 unreachable!()
             }
-            if let Some(Item::X(exp)) = self.rtape.get_mut(idx + 2) {
+            if let Some(Item::X(exp)) = self.rtape.get_mut(idx) {
                 *exp -= move_exp_value
             } else {
                 unreachable!()
@@ -261,12 +213,12 @@ impl Configuration {
     }
 
     // Attempt to apply the @uni-cycle
-    fn try_uni_cycle(&mut self) -> bool {
-        match (self.dir, self.ltape.as_mut_slice(), self.rtape.as_mut_slice()) {
+    fn try_uni_cycle(&mut self, cidxs: &[usize]) -> bool {
+        match (self.ltape.as_mut_slice(), self.rtape.as_mut_slice()) {
             // Example config:
             //   84719:  ! a^1 1 x^7640 D x^10345 3 x^7639 D x^10347 3 x^7635 D x^10355 1 x^7618 D x^10389 2 x^7550 D x^10524 0 x^7279 D x^11066 3 x^6197 D x^13231 1 x^1866 DD x^7713 0 x^95 2D x^598586766 1D >  x^300 D x^30826  b^8 D x^42804942 D x^3076 D x^1538 D x^300 D x^21397226 D x^13012670 D x^2139716 D x^1069858 D x^213964 D x^21621178 D x^3440996 D x^1720498 D x^344092 D x^1414318 D x^223068 D x^211854560 3 x^673806909 P
             #[rustfmt::skip]
-            (Direction::Right,
+            (
                 [.., Item::E { block: 0, exp: a_count },
                     Item::C(1), Item::X(7640), Item::D, Item::X(10345),
                     Item::C(3), Item::X(7639), Item::D, Item::X(10347),
@@ -287,7 +239,7 @@ impl Configuration {
                 // max cycles before big_count is too small.
                 let max_cycles_left = *big_count / UNI_CYCLE_REDUCE;
                 // max_strides is max times we can stride before there is a crash on right side.
-                let max_strides = Self::count_accel_strides(rtape_tail);
+                let max_strides = Self::count_accel_strides(rtape_tail, cidxs);
                 let max_cycles_right = max_strides / UNI_CYCLE_STRIDE;
                 // We cycle until one of the two above is imminent.
                 let num_cycles = cmp::min(max_cycles_left, max_cycles_right);
@@ -299,10 +251,10 @@ impl Configuration {
 
                     // Apply updates to right half of tape.
                     let num_strides = num_cycles.checked_mul(UNI_CYCLE_STRIDE).unwrap();
-                    if let Some(idxs) = self.naive_accel_idxs() {
-                        self.apply_multiple_strides(num_strides, idxs);
+
+                    if !cidxs.is_empty() {
+                        self.apply_multiple_strides(num_strides, cidxs);
                     } else {
-                        // The only reason that this can fail naive_accel_idxs() is if there are no Cs to the right, in which case striding is easy :)
                         assert!(self
                             .rtape
                             .iter()
@@ -312,13 +264,10 @@ impl Configuration {
                     }
                     return true;
                 }
-                return false;
             }
-            _ => {
-                // We are not in a @uni-cycle.
-                return false;
-            }
+            _ => (), // We are not in a @uni-cycle.
         }
+        false
     }
 
     fn step(&mut self) -> Result<(), Err> {
@@ -666,18 +615,23 @@ impl Configuration {
     }
 
     fn gen_step(&mut self, cfg: Config) -> Result<(), Err> {
-        if cfg.accel_uni_cycles {
-            if self.try_uni_cycle() {
-                self.stats.num_uni_cycles += 1;
-                return Ok(());
+        if self.dir == Direction::Right && (cfg.accel_uni_cycles || cfg.accel_counters) {
+            if let Some(idxs) = self.naive_accel_idxs() {
+                if cfg.accel_uni_cycles {
+                    if self.try_uni_cycle(&idxs) {
+                        self.stats.num_uni_cycles += 1;
+                        return Ok(());
+                    }
+                }
+
+                if cfg.accel_counters && !idxs.is_empty() {
+                    self.apply_multiple_strides(1, &idxs);
+                    self.dir = Direction::Left;
+                    return Ok(());
+                }
             }
         }
-        if cfg.accel_counters {
-            if self.accelerate() {
-                self.stats.num_strides += 1;
-                return Ok(());
-            }
-        }
+
         self.step()
     }
 
