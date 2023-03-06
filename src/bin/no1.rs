@@ -51,12 +51,14 @@ type Tape = Vec<Item>;
 
 type RefBlocks<'a> = &'a [&'a [Item]];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct SimStats {
     // Number of times an "increment" of counter config happens.
     // Precisely this counts the number of times that `> R -> < R` occurs (including extrapolating
     // number of times that transition would have occurred during counter acceleration (strides)).
     num_counter_increments: Exp,
+    // **Incomplete** Number of base TM steps ... currently does not include steps from any accelerations.
+    num_tm_steps: Exp,
     // Number of times accelerate() is applied (Counter acceleration).
     num_strides: u64,
     // Number of times try_uni_cycle() is applied (@uni-cycle accleration).
@@ -86,19 +88,6 @@ struct Configuration {
 }
 
 impl SimStats {
-    pub fn new() -> SimStats {
-        SimStats {
-            num_counter_increments: 0,
-            num_strides: 0,
-            num_uni_cycles: 0,
-            num_a_create: 0,
-            num_c_create: 0,
-            num_collisions: 0,
-            last_collision_incr: 0,
-            log2_collision_times_hist: [0; 20],
-        }
-    }
-
     fn record_collision(&mut self) {
         self.num_collisions += 1;
 
@@ -106,6 +95,8 @@ impl SimStats {
         let log_collision_time = (collision_time + 1).ilog2();
         let index: usize = log_collision_time.clamp(0, 19).try_into().unwrap();
         self.log2_collision_times_hist[index] += 1;
+
+        self.last_collision_incr = self.num_counter_increments;
     }
 }
 
@@ -131,7 +122,7 @@ impl Configuration {
             rtape: vec![Item::P],
             dir: Direction::Right,
             sim_step: 0,
-            stats: SimStats::new(),
+            stats: Default::default(),
         }
     }
 
@@ -215,7 +206,7 @@ impl Configuration {
         }
 
         let mut min_exp = 1;
-        rtape
+        let max_reps = rtape
             .windows(3)
             .rev()
             .filter_map(|w| match w {
@@ -228,8 +219,13 @@ impl Configuration {
                 [_, Item::C(3), _] => Some(0), // if there is a `3` then it should be in a valid position
                 _ => None,
             })
-            .min()
-            .unwrap_or(Exp::MAX)
+            .min();
+        if let Some(reps) = max_reps {
+            reps
+        } else {
+            // This is the case where there are no Cs on the right. In that case we can do infinite strides b/c there are no Cs to collide!
+            Exp::MAX
+        }
     }
 
     // Apply multiple "strides" (applications of accelerate()) only to right hand side of tape.
@@ -291,8 +287,17 @@ impl Configuration {
                     *b_count = b_count.checked_add(num_cycles).unwrap();
 
                     // Apply updates to right half of tape.
-                    if let Some(to_exp_idxs) = self.naive_accel_idxs() {
-                        self.apply_multiple_strides(num_cycles.checked_mul(UNI_CYCLE_STRIDE).unwrap(), to_exp_idxs);
+                    let num_strides = num_cycles.checked_mul(UNI_CYCLE_STRIDE).unwrap();
+                    if let Some(idxs) = self.naive_accel_idxs() {
+                        self.apply_multiple_strides(num_strides, idxs);
+                    } else {
+                        // The only reason that this can fail naive_accel_idxs() is if there are no Cs to the right, in which case striding is easy :)
+                        assert!(self
+                            .rtape
+                            .iter()
+                            .skip(1)
+                            .all(|item| matches!(item, Item::D | Item::X(_) | Item::E { block: 1, exp: _ })));
+                        self.stats.num_counter_increments = self.stats.num_counter_increments.checked_add(num_strides).unwrap();
                     }
                     return true;
                 }
@@ -341,6 +346,7 @@ impl Configuration {
                 self.rtape.push(Item::D);
                 self.ltape.push(Item::C(1));
                 self.dir = Right;
+                // TODO: update self.stats.num_tm_steps
             }
             // NEW `x > end` -> ` < 3xP` // $  cargo run --release --bin on2 8 0 --conf "! 011011 A> 00000000 !"
             (Right, [.., Item::X(exp)], []) => {
@@ -349,12 +355,14 @@ impl Configuration {
                 self.rtape.push(Item::X(1));
                 self.rtape.push(Item::C(3));
                 self.dir = Left;
+                self.stats.num_tm_steps += 79; // x A> $ -(79)-> <C10 C3 x R
             }
             // NEW `D > end` -> `< x` // $ cargo run --release --bin on2 4 0 --conf "! 011 01 A> 000 !" ... 6:   <C 10 a^2 !
             (Right, [.., Item::D], []) => {
                 self.ltape.pop();
                 self.rtape.push(Item::X(1)); // || test Item::P + Item::P
                 self.dir = Left;
+                // TODO: update self.stats.num_tm_steps
             }
 
             // `> D33` -> `P0 >` // $ cargo run --release --bin on2 8 0 --conf "! A> 11010 1010 1010 !"
@@ -363,6 +371,7 @@ impl Configuration {
                 self.ltape.push(Item::P);
                 self.ltape.push(Item::C(0));
                 self.stats.record_collision();
+                // TODO: update self.stats.num_tm_steps
             }
             // `> D3` -> `xP >`
             (Right, _, [.., Item::C(3), Item::D]) => {
@@ -370,15 +379,18 @@ impl Configuration {
                 push_or_merge_x(&mut self.ltape, 1);
                 self.ltape.push(Item::P);
                 self.stats.record_collision();
+                self.stats.num_tm_steps += 11; // > D3 -(7)-> D > 3 -(4)-> 011 01 1011 A>
             }
 
             // `x < ` -> `< x` // x now needs merge in this direction because of acceleration
             (Left, [.., Item::X(exp)], _) => {
+                let exp_const = *exp;
                 push_or_merge_x(&mut self.rtape, *exp);
                 self.ltape.pop();
+                self.stats.num_tm_steps += 6 * exp_const; // 011 <C10 -(3)-> <C10 110
             }
             // `(D | P | 3) < ` -> `< (D | P | 3)`
-            (Left, [.., Item::D | Item::P | Item::C(3)], _) => {
+            (Left, [.., Item::D], _) => {
                 let item = self.ltape.pop().unwrap();
                 self.rtape.push(item);
 
@@ -393,15 +405,35 @@ impl Configuration {
                     }
                     // return Err(Err::Interesting);
                 }
+                self.stats.num_tm_steps += 9; // 011 01 <C10 -(6)-> 011 <C10 10 -(3)-> <C10 110 10
             }
-            // needs to be after previous case (c != 3)
+            (Left, [.., Item::P], _) => {
+                let item = self.ltape.pop().unwrap();
+                self.rtape.push(item);
+                self.stats.num_tm_steps += 3; // 011 <C10 -(3)-> <C10 110
+            }
+            (Left, [.., Item::C(3)], _) => {
+                let item = self.ltape.pop().unwrap();
+                self.rtape.push(item);
+                self.stats.num_tm_steps += 12; // 01 <C10 -(6)-> <C10 10
+            }
             // `0 <` -> `1x >` | `1 < ` -> `2 >` | `2 <` -> `3x >`
-            (Left, [.., Item::C(c)], _) => {
+            (Left, [.., Item::C(c @ 0)], _) => {
                 *c += 1;
-                if *c != 2 {
-                    self.ltape.push(Item::X(1));
-                }
+                self.ltape.push(Item::X(1));
                 self.dir = Right;
+                self.stats.num_tm_steps += 17; // 111 011 <C10 -(3)-> 111 <C10 110 -(14)-> 01 011 011 A>
+            }
+            (Left, [.., Item::C(c @ 1)], _) => {
+                *c += 1;
+                self.dir = Right;
+                self.stats.num_tm_steps += 11; // 001 <C10 -(11)-> 11011 A>
+            }
+            (Left, [.., Item::C(c @ 2)], _) => {
+                *c += 1;
+                self.ltape.push(Item::X(1));
+                self.dir = Right;
+                self.stats.num_tm_steps += 17; // 111 011 <C10 -(3)-> 111 <C10 110 -(14)-> 01 011 011 A>
             }
 
             // CHANGED `x > 3` -> `0 >` // from `> x^n 3` -> `x^(n-1) 0 >`
@@ -419,17 +451,7 @@ impl Configuration {
                 }
                 self.ltape.push(Item::C(0));
                 self.rtape.pop();
-            }
-            // `b^n > 3` -> `b^(n-1) D x^72142 D x^3076 D x^1538 D x^300 D x^30825 0 >`
-            (Right, [.., Item::E { block: 1, exp }], [.., Item::C(3)]) => {
-                *exp -= 1;
-                if *exp == 0 {
-                    self.ltape.pop();
-                }
-                use Item::*;
-                self.ltape.extend_from_slice(&[D, X(72142), D, X(3076), D, X(1538), D, X(300), D, X(30825)]); // 30826 -> 30825
-                self.ltape.push(Item::C(0));
-                self.rtape.pop();
+                self.stats.num_tm_steps += 4; // A> 1010 -(4)-> 1011 A>
             }
 
             // `0 > 3` (== `> x33`) -> `L(2332) >` // $ cargo run --release --bin on2 8 0 --conf "! 011 0111 011 A> 1010 !"
@@ -438,6 +460,7 @@ impl Configuration {
                 self.ltape.push(Item::L(2332));
                 self.rtape.pop();
                 self.stats.record_collision();
+                // TODO: update self.stats.num_tm_steps
             }
             // `L(2332) <` -> `L(2301) x >` // $ cargo run --release --bin on2 8 0 --conf "! 01101110111 a^1 <C 10 !"
             (Left, [.., Item::L(2332)], _) => {
@@ -445,12 +468,14 @@ impl Configuration {
                 self.ltape.push(Item::L(2301));
                 self.ltape.push(Item::X(1));
                 self.dir = Right;
+                // TODO: update self.stats.num_tm_steps
             }
             // `L(2301) <` -> `L(252) >` // $ cargo run --release --bin on2 8 0 --conf "! 0110111001 <C 10 !"
             (Left, [.., Item::L(2301)], _) => {
                 self.ltape.pop();
                 self.ltape.push(Item::L(252));
                 self.dir = Right;
+                // TODO: update self.stats.num_tm_steps
             }
             // `L(252) <` -> `PDx >` // $ cargo run --release --bin on2 8 0 --conf "! 011011111 a^1  <C 10 !"
             (Left, [.., Item::L(252)], _) => {
@@ -459,6 +484,7 @@ impl Configuration {
                 self.ltape.push(Item::D);
                 self.ltape.push(Item::X(1));
                 self.dir = Right;
+                // TODO: update self.stats.num_tm_steps
             }
             // `> PD3x` -> `L(2301) D > P` // $ cargo run --release --bin on2 5 0 --conf "! A> 110 11010 1010 110110 !" ... 31:   !  a^2 1001 a^1 01 A> 110 !
             (Right, _, [.., Item::X(exp), Item::C(3), Item::D, Item::P]) => {
@@ -466,6 +492,7 @@ impl Configuration {
                 self.rtape.push(Item::P);
                 self.ltape.push(Item::L(2301));
                 self.ltape.push(Item::D);
+                // TODO: update self.stats.num_tm_steps
             }
             // `> PDDx` -> `21D > ` // $ cargo run --release --bin on2 8 0 --conf "! A> 110 11010 11010 110110 !" ... 63:   !  a^1 11 a^2 001 a^1 01 A>  !
             (Right, _, [.., Item::X(exp), Item::D, Item::D, Item::P]) => {
@@ -473,6 +500,7 @@ impl Configuration {
                 self.ltape.push(Item::C(2));
                 self.ltape.push(Item::C(1));
                 self.ltape.push(Item::D);
+                // TODO: update self.stats.num_tm_steps
             }
             // `2 > 3` (== `13 <`) -> `L(432) >` // $ cargo run --release --bin on2 8 0 --conf "! 011 0111 011 A> 1010 !"
             (Right, [.., Item::C(2)], [.., Item::C(3)]) => {
@@ -480,6 +508,7 @@ impl Configuration {
                 self.ltape.push(Item::L(432));
                 self.rtape.pop();
                 self.stats.record_collision();
+                self.stats.num_tm_steps += 4; // A> 1010 -(4)-> 1011 A>
             }
             // `L(432) <` -> `L(401) x >` // $ cargo run --release --bin on2 8 0 --conf "! 011110111 a^1 <C 10 !"
             (Left, [.., Item::L(432)], _) => {
@@ -487,12 +516,14 @@ impl Configuration {
                 self.ltape.push(Item::L(401));
                 self.ltape.push(Item::X(1));
                 self.dir = Right;
+                self.stats.num_tm_steps += 17; // 111 011 <C10 -(3)-> 111 <C10 110 -(14)-> 01 011 011 A>
             }
             // `L(401) <` -> `L(62) >` // $ cargo run --release --bin on2 8 0 --conf "! 01111001 <C 10 !"
             (Left, [.., Item::L(401)], _) => {
                 self.ltape.pop();
                 self.ltape.push(Item::L(62));
                 self.dir = Right;
+                self.stats.num_tm_steps += 11; // 001 <C10 -(11)-> 11011 A>
             }
             // `L(62) <` -> `L(31) x >` // $ cargo run --release --bin on2 8 0 --conf "! 0111111 a^1 <C 10 !"
             (Left, [.., Item::L(62)], _) => {
@@ -500,6 +531,7 @@ impl Configuration {
                 self.ltape.push(Item::L(31));
                 self.ltape.push(Item::X(1));
                 self.dir = Right;
+                self.stats.num_tm_steps += 17; // 111 011 <C10 -(3)-> 111 <C10 110 -(14)-> 01 011 011 A>
             }
             // `x L(31) <` -> `P1D >` // $ cargo run --release --bin on2 8 0 --conf "! 011011 011101 <C 10 !"
             (Left, [.., Item::X(exp), Item::L(31)], _) => {
@@ -508,19 +540,23 @@ impl Configuration {
                 self.ltape.push(Item::C(1));
                 self.ltape.push(Item::D);
                 self.dir = Right;
+                self.stats.num_tm_steps += 17; // 111 01 <C10 -(6)-> 111 <C10 10 -(4)-> 01 A> 110 10 -(7)-> 01 011 01 A>
             }
 
             // `> P x^n` -> `x^n > P`
             (Right, _, [.., Item::X(exp), Item::P]) => {
+                let exp_const = *exp;
                 push_or_merge_x(&mut self.ltape, *exp);
                 pop_n(&mut self.rtape, 2);
-                self.rtape.push(Item::P)
+                self.rtape.push(Item::P);
+                self.stats.num_tm_steps += 10 * exp_const; // A> 110110 -(10)-> 011011 A>
             }
             // `> PDP` -> `1D >`
             (Right, _, [.., Item::P, Item::D, Item::P]) => {
                 pop_n(&mut self.rtape, 3);
                 self.ltape.push(Item::C(1));
-                self.ltape.push(Item::D)
+                self.ltape.push(Item::D);
+                self.stats.num_tm_steps += 27; // A> 110 110 10 110 -(10)-> 011 011 A> 10 110 -(6)-> 011 0 111 <C10 10 -(4)-> 011 001 A> 110 10 -(7)-> 011 001 011 01 A>
             }
             // `> PDx` -> `1D > P`
             (Right, _, [.., Item::X(exp), Item::D, Item::P]) => {
@@ -528,6 +564,7 @@ impl Configuration {
                 self.rtape.push(Item::P);
                 self.ltape.push(Item::C(1));
                 self.ltape.push(Item::D);
+                self.stats.num_tm_steps += 27; // A> 110 110 10 110 -(10)-> 011 011 A> 10 110 -(6)-> 011 0 111 <C10 10 -(4)-> 011 001 A> 110 10 -(7)-> 011 001 011 01 A>
             }
             // `> P3x` -> `< PDP`
             (Right, _, [.., Item::X(exp), Item::C(3), Item::P]) => {
@@ -536,24 +573,29 @@ impl Configuration {
                 self.rtape.push(Item::D);
                 self.rtape.push(Item::P);
                 self.dir = Left;
+                self.stats.num_tm_steps += 19; // A> 110 10 10 110 -(7)-> 011 01 A> 10 110 -(6)-> 011 011 <C10 10 -(6)-> <C10 110 110 10
             }
             // `> P end` -> `< P`
             (Right, _, [Item::P]) => {
                 self.dir = Left;
                 self.stats.num_counter_increments = self.stats.num_counter_increments.checked_add(1).unwrap();
+                self.stats.num_tm_steps += 9; // A> 110 $ -(6)-> 011 <C10 $ -(3)-> <C10 110 $
             }
             // CHANGED `> PP` -> `x >` // from `> PP end`
             (Right, _, [.., Item::P, Item::P]) => {
                 pop_n(&mut self.rtape, 2);
                 push_or_merge_x(&mut self.ltape, 1);
+                self.stats.num_tm_steps += 10; // A> 110110 -(5)-> 011 B> 110 -(5)-> 011011 A>
             }
             // `> D` -> `D >`
             (Right, _, [.., Item::D]) => {
                 self.rtape.pop();
                 self.ltape.push(Item::D);
+                self.stats.num_tm_steps += 7; // A> 11010 -(5)-> 011 B> 10 -(2)-> 01101 A>
             }
             // `> x` -> `x >`
             (Right, _, [.., Item::X(exp)]) => {
+                let exp_const = *exp;
                 // compression here no longer works with acceleration
                 // let test_b = *exp == 30826; // --conf "2 > D x^598979953 PDP x^72142 D x^3076 D x^1538 D x^300 D x^30826 D x^42804942 D x^213427271 3 x^670661487 P"
                 push_or_merge_x(&mut self.ltape, *exp);
@@ -568,6 +610,7 @@ impl Configuration {
                 //     // return Err(Err::Interesting);
                 // }
                 self.rtape.pop();
+                self.stats.num_tm_steps += 10 * exp_const; // A> 110110 -(10)-> 011011 A>
             }
             // `> b` -> `b >`
             (Right, _, [.., Item::E { block: 1, exp: move_exp }]) => {
@@ -577,11 +620,13 @@ impl Configuration {
                     self.ltape.push(Item::E { block: 1, exp: *move_exp })
                 }
                 self.rtape.pop();
+                // TODO: update self.stats.num_tm_steps
             }
             // `b < ` -> `< b`
             (Left, [.., Item::E { block: 1, exp: move_exp }], _) => {
                 self.rtape.push(Item::E { block: 1, exp: *move_exp });
                 self.ltape.pop();
+                // TODO: update self.stats.num_tm_steps
             }
             // `c^n < ` -> `c^(n-1) expanded-c <`
             (Left, [.., Item::E { block: 2, exp }], _) => {
@@ -592,6 +637,18 @@ impl Configuration {
                 use Item::*;
                 let e = [C(1), D, X(72141), C(1), D, X(3075), C(1), D, X(1537), C(1), D, X(299), C(1), D, X(30825)];
                 self.ltape.extend_from_slice(&e); // NUDO: use extend() if Items gets bigger / allocates
+                // TODO: update self.stats.num_tm_steps
+            }
+            // `b^n > 3` = `b^(n-1) expanded-b > 3`
+            (Right, [.., Item::E { block: 1, exp }], [.., Item::C(3)]) => {
+                *exp -= 1;
+                if *exp == 0 {
+                    self.ltape.pop();
+                }
+                use Item::*;
+                let e = [D, X(72142), D, X(3076), D, X(1538), D, X(300), D, X(30826)];
+                self.ltape.extend_from_slice(&e); // NUDO: use extend() if Items gets bigger / allocates
+                // 0 TM steps
             }
             (Left, [.., Item::Unreachable], _) | (Right, _, [.., Item::Unreachable]) => {
                 return Err(Err::Unreachable);
@@ -603,6 +660,7 @@ impl Configuration {
                 pop_n(&mut self.rtape, 2);
                 self.rtape.push(Item::P);
                 self.stats.num_c_create += 1;
+                // TODO: update self.stats.num_tm_steps
             }
 
             _ => return Err(Err::UnknownTransition),
@@ -617,9 +675,11 @@ impl Configuration {
                 return Ok(());
             }
         }
-        if self.accelerate() {
-            self.stats.num_strides += 1;
-            return Ok(());
+        if cfg.accel_counters {
+            if self.accelerate() {
+                self.stats.num_strides += 1;
+                return Ok(());
+            }
         }
         self.step()
     }
@@ -628,10 +688,14 @@ impl Configuration {
         while self.sim_step < cfg.sim_step_limit {
             let old_a = self.stats.num_a_create;
             let old_c = self.stats.num_c_create;
+            let _old_coll = self.stats.num_collisions;
             self.gen_step(cfg)?;
             self.sim_step += 1;
 
             // Print logic
+            // if self.stats.num_collisions > _old_coll {
+            //     println!("{self}");
+            // }
             if cfg.print_only_cycles {
                 if self.stats.num_a_create != old_a || self.stats.num_c_create != old_c {
                     println!("{self}");
@@ -690,14 +754,14 @@ impl fmt::Display for SimStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Stats({:.2e}, {}, {}, {}, {}, {}, {:?})",
+            "Stats({}, {}, {}, {}, {}, {}, {})",
             self.num_counter_increments.blue(),
+            self.num_tm_steps.blue(),
             self.num_collisions.blue(),
             self.num_strides.blue(),
             self.num_uni_cycles.blue(),
             self.num_a_create.blue(),
             self.num_c_create.blue(),
-            self.log2_collision_times_hist,
         )
     }
 }
@@ -708,7 +772,7 @@ fn raw_parse(s: &str) -> Result<(Configuration, Direction)> {
         rtape: Tape::new(),
         dir: Direction::Right,
         sim_step: 0,
-        stats: SimStats::new(),
+        stats: Default::default(),
     };
     let mut active_tape_dir = Direction::Left;
     let mut tape = &mut conf.ltape;
@@ -795,8 +859,10 @@ struct Args {
 
     #[argh(switch, short = 'x', description = "interpret step limit directly (not as 2^n)?")]
     non_exponential_steps: bool,
-    #[argh(switch, short = 'c', description = "accelerate @uni-cycles")]
-    accel_uni_cycles: bool,
+    #[argh(switch, description = "disable counter acceleration")]
+    no_accel_counters: bool,
+    #[argh(switch, description = "disable @uni-cycles acceleration")]
+    no_accel_uni_cycles: bool,
     #[argh(switch, short = 'a', description = "only print when a new a^1 block or c-block is produced.")]
     print_only_cycles: bool,
 }
@@ -805,6 +871,7 @@ struct Args {
 struct Config {
     sim_step_limit: usize,
     print_mod: u8,
+    accel_counters: bool,
     accel_uni_cycles: bool,
     print_only_cycles: bool,
 }
@@ -825,7 +892,8 @@ fn main() -> Result<()> {
     let cfg = Config {
         sim_step_limit: sim_step_limit,
         print_mod: args.print_mod,
-        accel_uni_cycles: args.accel_uni_cycles,
+        accel_counters: !args.no_accel_counters,
+        accel_uni_cycles: !args.no_accel_uni_cycles,
         print_only_cycles: args.print_only_cycles,
     };
     let mut conf = args.conf;
